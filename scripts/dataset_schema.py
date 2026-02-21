@@ -58,13 +58,13 @@ class PhysicsExample:
     """
 
     # --- Metadata ---
-    vestibular: str        # Exam board (e.g., "FUVEST", "ITA", "Unicamp")
-    year: int              # Exam year
-    question_number: str   # Question identifier (e.g., "Q3", "Q5a")
-    topic: str             # Physics subfield (e.g., "Thermodynamics")
+    vestibular: str  # Exam board (e.g., "FUVEST", "ITA", "Unicamp")
+    year: int  # Exam year
+    question_number: str  # Question identifier (e.g., "Q3", "Q5a")
+    topic: str  # Physics subfield (e.g., "Thermodynamics")
 
     # --- Solver input ---
-    question: str          # Full question text with inline LaTeX
+    question: str  # Full question text with inline LaTeX
     reference_data: ReferenceData = field(default_factory=ReferenceData)
 
     # --- Evaluation labels ---
@@ -103,9 +103,7 @@ class PhysicsExample:
             question_number=data["question_number"],
             topic=data["topic"],
             question=data["question"],
-            reference_data=ReferenceData.from_dict(
-                data.get("reference_data", {})
-            ),
+            reference_data=ReferenceData.from_dict(data.get("reference_data", {})),
             expected_value=data.get("expected_value"),
             expected_unit=data.get("expected_unit"),
             solution_steps=data.get("solution_steps"),
@@ -170,8 +168,6 @@ def validate_dataset(examples: list[PhysicsExample]) -> list[str]:
         if not ex.solution_steps:
             warnings.append(f"{label} Missing solution_steps.")
         if ex.has_figure and not ex.figure_description:
-            warnings.append(
-                f"{label} has_figure=True but figure_description is empty."
-            )
+            warnings.append(f"{label} has_figure=True but figure_description is empty.")
 
     return warnings

@@ -14,14 +14,17 @@ Directory conventions:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from dataset_schema import (
+from scripts.dataset_schema import (
     Constant,
     PhysicsExample,
     ReferenceData,
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class PipelineConfig:
@@ -48,7 +52,6 @@ class PipelineConfig:
                         answers are embedded in questions_pdf.
         output_path:    Destination JSONL file.
         cache_dir:      Directory for intermediate Markdown files.
-        model:          Ollama model name or "gemini" to use Gemini API.
         overwrite_cache: If True, re-runs Marker even if cache exists.
     """
 
@@ -58,7 +61,6 @@ class PipelineConfig:
     output_path: Path
     answers_pdf: Path | None = None
     cache_dir: Path = Path("cache")
-    model: str = "llama3.2"
     overwrite_cache: bool = False
 
 
@@ -66,12 +68,15 @@ class PipelineConfig:
 # Step 1: PDF → Markdown (Marker)
 # ---------------------------------------------------------------------------
 
+
 def pdf_to_markdown(pdf_path: Path, cache_dir: Path, overwrite: bool = False) -> str:
     """
     Convert a PDF to Markdown using Marker, with disk caching.
 
-    The cache key is the PDF filename stem. If a cached .md file exists and
-    overwrite is False, the cached version is returned immediately.
+    The cache key is derived from the resolved PDF path plus file freshness
+    metadata (size + mtime_ns), preventing collisions across directories and
+    invalidating cache entries when a PDF changes in-place. If a cached .md
+    file exists and overwrite is False, the cached version is returned.
 
     Args:
         pdf_path:   Path to the source PDF.
@@ -82,7 +87,11 @@ def pdf_to_markdown(pdf_path: Path, cache_dir: Path, overwrite: bool = False) ->
         Markdown string with inline LaTeX equations.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{pdf_path.stem}.md"
+    resolved_path = pdf_path.resolve()
+    stat = resolved_path.stat()
+    cache_material = f"{resolved_path}|{stat.st_size}|{stat.st_mtime_ns}"
+    cache_key = hashlib.sha256(cache_material.encode("utf-8")).hexdigest()[:12]
+    cache_path = cache_dir / f"{pdf_path.stem}-{cache_key}.md"
 
     if cache_path.exists() and not overwrite:
         logger.info("Cache hit: %s", cache_path)
@@ -111,9 +120,7 @@ def _run_marker(pdf_path: Path) -> str:
         from marker.models import create_model_dict
         from marker.output import text_from_rendered
     except ImportError as e:
-        raise ImportError(
-            "Marker is not installed. Run: uv add marker-pdf"
-        ) from e
+        raise ImportError("Marker is not installed. Run: uv add marker-pdf") from e
 
     config_parser = ConfigParser({})
     converter = PdfConverter(
@@ -165,7 +172,6 @@ ANSWERS MARKDOWN:
 def extract_questions_with_llm(
     questions_markdown: str,
     answers_markdown: str,
-    model: str,
 ) -> list[dict]:
     """
     Send Markdown content to an LLM and parse the returned JSON array.
@@ -173,7 +179,6 @@ def extract_questions_with_llm(
     Args:
         questions_markdown: Marker output for the questions PDF.
         answers_markdown:   Marker output for the answers PDF.
-        model:              Ollama model name or "gemini".
 
     Returns:
         List of raw dicts, one per extracted question.
@@ -183,23 +188,39 @@ def extract_questions_with_llm(
         answers_markdown=answers_markdown,
     )
 
-    if model == "gemini":
+    llm_provider = os.environ.get("LLM_PROVIDER", "gemini")
+
+    if llm_provider not in ("gemini", "ollama"):
+        raise ValueError(
+            f"Unknown LLM_PROVIDER: {llm_provider!r}. Use 'gemini' or 'ollama'."
+        )
+
+    if llm_provider == "gemini":
+        if not os.environ.get("GOOGLE_API_KEY"):
+            raise OSError(
+                "GOOGLE_API_KEY environment variable is not set. "
+                "Copy sample.env to .env and fill in your key."
+            )
         raw = _call_gemini(prompt)
     else:
-        raw = _call_ollama(prompt, model)
+        raw = _call_ollama(prompt)
 
     return _parse_json_response(raw)
 
 
-def _call_ollama(prompt: str, model: str) -> str:
+def _call_ollama(prompt: str) -> str:
     """Call a local Ollama model and return the raw text response."""
     try:
         import ollama
     except ImportError as e:
         raise ImportError("Ollama is not installed. Run: uv add ollama") from e
 
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    model = os.environ.get("OLLAMA_MODEL", "llama3.2")
     logger.info("Calling Ollama model: %s", model)
-    response = ollama.chat(
+
+    client = ollama.Client(host=host)
+    response = client.chat(
         model=model,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -215,8 +236,12 @@ def _call_gemini(prompt: str) -> str:
             "google-generativeai is not installed. Run: uv add google-generativeai"
         ) from e
 
-    logger.info("Calling Gemini API ...")
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    logger.info("Calling Gemini model: %s", model_name)
+
+    model = genai.GenerativeModel(model_name)
     response = model.generate_content(prompt)
     return response.text
 
@@ -249,9 +274,7 @@ def _parse_json_response(raw: str) -> list[dict]:
         ) from e
 
     if not isinstance(result, list):
-        raise ValueError(
-            f"Expected a JSON array, got {type(result).__name__}."
-        )
+        raise ValueError(f"Expected a JSON array, got {type(result).__name__}.")
 
     return result
 
@@ -260,8 +283,9 @@ def _parse_json_response(raw: str) -> list[dict]:
 # Step 3: dicts → PhysicsExample objects
 # ---------------------------------------------------------------------------
 
+
 def dicts_to_examples(
-    raw_questions: list[dict],
+    raw_questions: list[Any],
     vestibular: str,
     year: int,
 ) -> list[PhysicsExample]:
@@ -281,14 +305,19 @@ def dicts_to_examples(
     """
     examples = []
     for i, raw in enumerate(raw_questions):
+        question_number = (
+            raw.get("question_number", "unknown")
+            if isinstance(raw, dict)
+            else "unknown"
+        )
         try:
             example = _dict_to_example(raw, vestibular, year)
             examples.append(example)
-        except (KeyError, TypeError, ValueError) as e:
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
             logger.warning(
                 "Skipping question %d (%s): %s",
                 i,
-                raw.get("question_number", "unknown"),
+                question_number,
                 e,
             )
     return examples
@@ -330,6 +359,7 @@ def _dict_to_example(raw: dict, vestibular: str, year: int) -> PhysicsExample:
 # Main pipeline entrypoint
 # ---------------------------------------------------------------------------
 
+
 def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
     """
     Run the full extraction pipeline for one exam.
@@ -349,9 +379,7 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
         List of extracted PhysicsExample instances.
     """
     start = time.time()
-    logger.info(
-        "Starting pipeline: %s %d", config.vestibular, config.year
-    )
+    logger.info("Starting pipeline: %s %d", config.vestibular, config.year)
 
     # Step 1: questions PDF → Markdown
     questions_md = pdf_to_markdown(
@@ -372,9 +400,7 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
         answers_md = questions_md
 
     # Step 3: LLM extraction
-    raw_questions = extract_questions_with_llm(
-        questions_md, answers_md, config.model
-    )
+    raw_questions = extract_questions_with_llm(questions_md, answers_md)
     logger.info("LLM extracted %d raw questions.", len(raw_questions))
 
     # Step 4: convert to schema objects
@@ -416,7 +442,6 @@ if __name__ == "__main__":
         answers_pdf=Path("raw_pdfs/fuvest_2024_gabarito.pdf"),
         output_path=Path("data/fuvest/physics.jsonl"),
         cache_dir=Path("cache"),
-        model="llama3.2",          # swap to "gemini" for production
     )
 
     examples = run_pipeline(config)

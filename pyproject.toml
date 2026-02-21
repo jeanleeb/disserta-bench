@@ -1,0 +1,39 @@
+[project]
+name = "disserta-bench"
+version = "0.1.0"
+description = "Dataset of open-ended questions from Brazilian university entrance exams (FUVEST, ITA, Comvest), with official solutions and evaluation rubrics."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "google-generativeai>=0.8.6",
+    "marker-pdf>=1.10.2",
+    "ollama>=0.6.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+    "ty>=0.0.17",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["T201"]
+
+[tool.ty.environment]
+python = ".venv"
+
+[tool.ty.src]
+include = ["./scripts"]

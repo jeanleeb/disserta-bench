@@ -23,8 +23,9 @@ build/
 .DS_Store
 Thumbs.db
 
-# PDFs originais (não versionar — muito pesados)
+# PDFs originais e caches de processamento (não versionar — muito pesados)
 raw_pdfs/
+cache/
 
 # Outputs intermediários do pipeline
 *.log

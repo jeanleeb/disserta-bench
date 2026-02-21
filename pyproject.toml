@@ -3,12 +3,16 @@ name = "disserta-bench"
 version = "0.1.0"
 description = "Dataset of open-ended questions from Brazilian university entrance exams (FUVEST, ITA, Comvest), with official solutions and evaluation rubrics."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = "~=3.12.0"
 dependencies = [
-    "google-generativeai>=0.8.6",
-    "marker-pdf>=1.10.2",
+    "google-genai>=1.0.0",
     "ollama>=0.6.1",
+    "pymupdf>=1.25.0",
 ]
+
+[project.scripts]
+download-fuvest = "scripts.download_fuvest:main"
+extraction-pipeline = "scripts.extraction_pipeline:main"
 
 [dependency-groups]
 dev = [
@@ -19,7 +23,7 @@ dev = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -32,6 +36,13 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*" = ["T201"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["scripts"]
 
 [tool.ty.environment]
 python = ".venv"

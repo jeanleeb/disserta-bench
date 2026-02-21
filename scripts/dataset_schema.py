@@ -77,6 +77,9 @@ class PhysicsExample:
     has_figure: bool = False
     figure_description: str = ""
 
+    # --- Review status ---
+    needs_review: bool = False
+
     def to_dict(self) -> dict:
         """Serialize to a JSON-compatible dictionary (one line in JSONL)."""
         return {
@@ -92,6 +95,7 @@ class PhysicsExample:
             "rubric": self.rubric,
             "has_figure": self.has_figure,
             "figure_description": self.figure_description,
+            "needs_review": self.needs_review,
         }
 
     @classmethod
@@ -110,6 +114,7 @@ class PhysicsExample:
             rubric=data.get("rubric", []),
             has_figure=data.get("has_figure", False),
             figure_description=data.get("figure_description", ""),
+            needs_review=data.get("needs_review", False),
         )
 
 
@@ -159,14 +164,15 @@ def validate_dataset(examples: list[PhysicsExample]) -> list[str]:
 
         if not ex.question.strip():
             warnings.append(f"{label} Empty question text.")
-        if ex.expected_value is None:
-            warnings.append(f"{label} Missing expected_value.")
-        if not ex.expected_unit:
-            warnings.append(f"{label} Missing expected_unit.")
+        if not ex.needs_review:
+            if ex.expected_value is None:
+                warnings.append(f"{label} Missing expected_value.")
+            if not ex.expected_unit:
+                warnings.append(f"{label} Missing expected_unit.")
+            if not ex.solution_steps:
+                warnings.append(f"{label} Missing solution_steps.")
         if not ex.rubric:
             warnings.append(f"{label} No rubric criteria defined.")
-        if not ex.solution_steps:
-            warnings.append(f"{label} Missing solution_steps.")
         if ex.has_figure and not ex.figure_description:
             warnings.append(f"{label} has_figure=True but figure_description is empty.")
 

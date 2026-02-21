@@ -2,8 +2,9 @@
 Extraction pipeline for disserta-bench.
 
 Converts official exam PDFs into structured PhysicsExample objects using:
-  1. Marker  — PDF to Markdown with LaTeX OCR (cached to disk)
-  2. LLM     — Markdown to structured JSON (Ollama locally, Gemini in production)
+  1. OCR     — PDF pages rendered as images, then sent to a vision LLM
+               for text extraction (``scripts.ocr``)
+  2. LLM     — Markdown to structured JSON (``scripts.llm``)
   3. Schema  — JSON to PhysicsExample + JSONL output
 
 Directory conventions:
@@ -14,8 +15,7 @@ Directory conventions:
 
 from __future__ import annotations
 
-import hashlib
-import json
+import argparse
 import logging
 import os
 import re
@@ -31,8 +31,28 @@ from scripts.dataset_schema import (
     save_dataset,
     validate_dataset,
 )
+from scripts.llm import extract_questions_with_llm
+from scripts.ocr import pdf_to_markdown
 
 logger = logging.getLogger(__name__)
+
+
+def _load_dotenv() -> None:
+    """Load .env file from the project root if it exists, without overwriting."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    with env_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,8 +61,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineConfig:
-    """
-    Configuration for a single pipeline run.
+    """Configuration for a single pipeline run.
 
     Attributes:
         vestibular:     Exam board name (e.g., "FUVEST").
@@ -50,237 +69,20 @@ class PipelineConfig:
         questions_pdf:  Path to the questions PDF.
         answers_pdf:    Path to the answers/gabarito PDF. If None, assumes
                         answers are embedded in questions_pdf.
-        output_path:    Destination JSONL file.
         cache_dir:      Directory for intermediate Markdown files.
-        overwrite_cache: If True, re-runs Marker even if cache exists.
+        overwrite_cache: If True, re-runs OCR even if cache exists.
     """
 
     vestibular: str
     year: int
     questions_pdf: Path
-    output_path: Path
     answers_pdf: Path | None = None
     cache_dir: Path = Path("cache")
     overwrite_cache: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Step 1: PDF → Markdown (Marker)
-# ---------------------------------------------------------------------------
-
-
-def pdf_to_markdown(pdf_path: Path, cache_dir: Path, overwrite: bool = False) -> str:
-    """
-    Convert a PDF to Markdown using Marker, with disk caching.
-
-    The cache key is derived from the resolved PDF path plus file freshness
-    metadata (size + mtime_ns), preventing collisions across directories and
-    invalidating cache entries when a PDF changes in-place. If a cached .md
-    file exists and overwrite is False, the cached version is returned.
-
-    Args:
-        pdf_path:   Path to the source PDF.
-        cache_dir:  Directory where .md cache files are stored.
-        overwrite:  If True, ignore existing cache and re-run Marker.
-
-    Returns:
-        Markdown string with inline LaTeX equations.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    resolved_path = pdf_path.resolve()
-    stat = resolved_path.stat()
-    cache_material = f"{resolved_path}|{stat.st_size}|{stat.st_mtime_ns}"
-    cache_key = hashlib.sha256(cache_material.encode("utf-8")).hexdigest()[:12]
-    cache_path = cache_dir / f"{pdf_path.stem}-{cache_key}.md"
-
-    if cache_path.exists() and not overwrite:
-        logger.info("Cache hit: %s", cache_path)
-        return cache_path.read_text(encoding="utf-8")
-
-    logger.info("Running Marker on %s ...", pdf_path)
-    markdown = _run_marker(pdf_path)
-
-    cache_path.write_text(markdown, encoding="utf-8")
-    logger.info("Cached Markdown to %s", cache_path)
-
-    return markdown
-
-
-def _run_marker(pdf_path: Path) -> str:
-    """
-    Run Marker OCR on a PDF and return the resulting Markdown.
-
-    Marker is imported lazily so that the pipeline module can be imported
-    without Marker installed (e.g., in environments that only consume the
-    dataset schema).
-    """
-    try:
-        from marker.config.parser import ConfigParser
-        from marker.converters.pdf import PdfConverter
-        from marker.models import create_model_dict
-        from marker.output import text_from_rendered
-    except ImportError as e:
-        raise ImportError("Marker is not installed. Run: uv add marker-pdf") from e
-
-    config_parser = ConfigParser({})
-    converter = PdfConverter(
-        config=config_parser.generate_config_dict(),
-        artifact_dict=create_model_dict(),
-    )
-    rendered = converter(str(pdf_path))
-    markdown, _, _ = text_from_rendered(rendered)
-    return markdown
-
-
-# ---------------------------------------------------------------------------
-# Step 2: Markdown → structured dicts (LLM)
-# ---------------------------------------------------------------------------
-
-_EXTRACTION_PROMPT = """
-You are processing a Brazilian university entrance exam (vestibular) in physics.
-
-Below is the Markdown of the QUESTIONS section followed by the ANSWERS section.
-Extract each physics question as a JSON object.
-
-Return a JSON array where each element has exactly these fields:
-- question_number: string (e.g. "Q3", "Q5a")
-- topic: string (physics subfield in English, e.g. "Thermodynamics")
-- question: string (full question text, preserve inline LaTeX as $...$ or $$...$$)
-- reference_data: object with "constants" array, each having "symbol", "value", "unit"
-- expected_value: number (official numerical answer)
-- expected_unit: string (SI unit, e.g. "m/s", "J", "N")
-- solution_steps: string (step-by-step solution from the answer key)
-- rubric: array of strings (3-5 specific evaluation criteria for this question)
-- has_figure: boolean
-- figure_description: string (empty if has_figure is false)
-
-Rules:
-- Include ONLY questions that have a clear numerical answer.
-- Keep question text in Brazilian Portuguese.
-- Write rubric criteria in Brazilian Portuguese.
-- Write solution_steps in Brazilian Portuguese.
-- Return ONLY the JSON array, no markdown fences, no explanation.
-
-QUESTIONS MARKDOWN:
-{questions_markdown}
-
-ANSWERS MARKDOWN:
-{answers_markdown}
-"""
-
-
-def extract_questions_with_llm(
-    questions_markdown: str,
-    answers_markdown: str,
-) -> list[dict]:
-    """
-    Send Markdown content to an LLM and parse the returned JSON array.
-
-    Args:
-        questions_markdown: Marker output for the questions PDF.
-        answers_markdown:   Marker output for the answers PDF.
-
-    Returns:
-        List of raw dicts, one per extracted question.
-    """
-    prompt = _EXTRACTION_PROMPT.format(
-        questions_markdown=questions_markdown,
-        answers_markdown=answers_markdown,
-    )
-
-    llm_provider = os.environ.get("LLM_PROVIDER", "gemini")
-
-    if llm_provider not in ("gemini", "ollama"):
-        raise ValueError(
-            f"Unknown LLM_PROVIDER: {llm_provider!r}. Use 'gemini' or 'ollama'."
-        )
-
-    if llm_provider == "gemini":
-        if not os.environ.get("GOOGLE_API_KEY"):
-            raise OSError(
-                "GOOGLE_API_KEY environment variable is not set. "
-                "Copy sample.env to .env and fill in your key."
-            )
-        raw = _call_gemini(prompt)
-    else:
-        raw = _call_ollama(prompt)
-
-    return _parse_json_response(raw)
-
-
-def _call_ollama(prompt: str) -> str:
-    """Call a local Ollama model and return the raw text response."""
-    try:
-        import ollama
-    except ImportError as e:
-        raise ImportError("Ollama is not installed. Run: uv add ollama") from e
-
-    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "llama3.2")
-    logger.info("Calling Ollama model: %s", model)
-
-    client = ollama.Client(host=host)
-    response = client.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response["message"]["content"]
-
-
-def _call_gemini(prompt: str) -> str:
-    """Call the Gemini API and return the raw text response."""
-    try:
-        import google.generativeai as genai
-    except ImportError as e:
-        raise ImportError(
-            "google-generativeai is not installed. Run: uv add google-generativeai"
-        ) from e
-
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    logger.info("Calling Gemini model: %s", model_name)
-
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(prompt)
-    return response.text
-
-
-def _parse_json_response(raw: str) -> list[dict]:
-    """
-    Parse a JSON array from an LLM response, stripping markdown fences if present.
-
-    Args:
-        raw: Raw LLM output, possibly wrapped in ```json ... ```.
-
-    Returns:
-        Parsed list of dicts.
-
-    Raises:
-        ValueError: If the response cannot be parsed as a JSON array.
-    """
-    # Strip markdown code fences if the LLM wrapped the output
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
-    cleaned = re.sub(r"```\s*$", "", cleaned.strip(), flags=re.MULTILINE)
-    cleaned = cleaned.strip()
-
-    try:
-        result = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"LLM response is not valid JSON.\n"
-            f"Error: {e}\n"
-            f"Response (first 500 chars):\n{raw[:500]}"
-        ) from e
-
-    if not isinstance(result, list):
-        raise ValueError(f"Expected a JSON array, got {type(result).__name__}.")
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Step 3: dicts → PhysicsExample objects
+# dicts → PhysicsExample objects
 # ---------------------------------------------------------------------------
 
 
@@ -289,19 +91,10 @@ def dicts_to_examples(
     vestibular: str,
     year: int,
 ) -> list[PhysicsExample]:
-    """
-    Convert raw LLM-extracted dicts to validated PhysicsExample objects.
+    """Convert raw LLM-extracted dicts to validated PhysicsExample objects.
 
     Questions that cannot be converted (missing required fields, malformed
     data) are skipped with a warning rather than crashing the pipeline.
-
-    Args:
-        raw_questions: List of dicts from the LLM extraction step.
-        vestibular:    Exam board name (e.g., "FUVEST").
-        year:          Exam year.
-
-    Returns:
-        List of PhysicsExample instances.
     """
     examples = []
     for i, raw in enumerate(raw_questions):
@@ -361,8 +154,7 @@ def _dict_to_example(raw: dict, vestibular: str, year: int) -> PhysicsExample:
 
 
 def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
-    """
-    Run the full extraction pipeline for one exam.
+    """Run the full extraction pipeline for one exam.
 
     Steps:
         1. Convert questions PDF to Markdown (cached).
@@ -370,13 +162,6 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
         3. Extract structured questions via LLM.
         4. Convert to PhysicsExample objects.
         5. Validate and log warnings.
-        6. Save to JSONL.
-
-    Args:
-        config: Pipeline configuration for this exam.
-
-    Returns:
-        List of extracted PhysicsExample instances.
     """
     start = time.time()
     logger.info("Starting pipeline: %s %d", config.vestibular, config.year)
@@ -412,12 +197,9 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
     for warning in warnings:
         logger.warning(warning)
 
-    # Step 6: save
-    save_dataset(examples, config.output_path)
     logger.info(
-        "Saved %d examples to %s (%.1fs)",
+        "Pipeline done: %d examples (%.1fs)",
         len(examples),
-        config.output_path,
         time.time() - start,
     )
 
@@ -428,21 +210,175 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+_BASE_DIR = Path(__file__).resolve().parent.parent
+
+_DAY_RE = re.compile(r"^dia(\d+)\.pdf$", re.IGNORECASE)
+
+
+def _is_physics_relevant(filename: str) -> bool:
+    """Return True if a question PDF is likely to contain physics questions."""
+    lower = filename.lower()
+    if "fisica" in lower:
+        return True
+    day_match = _DAY_RE.match(lower)
+    if day_match:
+        return int(day_match.group(1)) >= 2
+    return False
+
+
+def _pick_answer_pdf(a_pdfs: list[Path]) -> Path | None:
+    """Pick the best answer PDF from available files.
+
+    Prefers physics-specific answer keys (``guia_respostas_fisica.pdf``)
+    over general ones.
+    """
+    if not a_pdfs:
+        return None
+    for pdf in a_pdfs:
+        if "fisica" in pdf.name.lower():
+            return pdf
+    return a_pdfs[0]
+
+
+def _parse_years(raw: list[str]) -> list[int]:
+    """Parse year arguments, supporting both ``2020`` and ``2020-2025``."""
+    years: list[int] = []
+    for token in raw:
+        if "-" in token:
+            lo, hi = token.split("-", 1)
+            years.extend(range(int(lo), int(hi) + 1))
+        else:
+            years.append(int(token))
+    years = [y for y in years if 1990 <= y <= 2100]
+    return sorted(set(years))
+
+
+def _process_year(
+    year: int,
+    *,
+    vestibular: str,
+    questions_dir: Path,
+    answers_dir: Path,
+    data_dir: Path,
+    review_dir: Path,
+    cache_dir: Path,
+    overwrite_cache: bool,
+) -> dict[str, int] | None:
+    """Process all physics-relevant PDFs for a single year."""
+    vest_lower = vestibular.lower()
+
+    year_q_dir = questions_dir / str(year)
+    if not year_q_dir.exists():
+        logger.warning("SKIP %d — no directory: %s", year, year_q_dir)
+        return None
+
+    q_pdfs = sorted(year_q_dir.glob("*.pdf"))
+    q_pdfs = [p for p in q_pdfs if _is_physics_relevant(p.name)]
+    if not q_pdfs:
+        logger.warning("SKIP %d — no physics-relevant PDFs", year)
+        return None
+
+    year_a_dir = answers_dir / str(year)
+    a_pdfs = sorted(year_a_dir.glob("*.pdf")) if year_a_dir.exists() else []
+    a_pdf = _pick_answer_pdf(a_pdfs)
+
+    all_examples: list[PhysicsExample] = []
+    for q_pdf in q_pdfs:
+        logger.info("Processing %s", q_pdf.name)
+        config = PipelineConfig(
+            vestibular=vestibular,
+            year=year,
+            questions_pdf=q_pdf,
+            answers_pdf=a_pdf,
+            cache_dir=cache_dir,
+            overwrite_cache=overwrite_cache,
+        )
+        all_examples.extend(run_pipeline(config))
+
+    complete = [ex for ex in all_examples if ex.expected_value is not None]
+    review = []
+    for ex in all_examples:
+        if ex.expected_value is None:
+            ex.needs_review = True
+            review.append(ex)
+
+    if complete:
+        out = data_dir / f"{vest_lower}_{year}.jsonl"
+        save_dataset(complete, out)
+        logger.info("Saved %d complete examples to %s", len(complete), out)
+
+    if review:
+        out = review_dir / f"{vest_lower}_{year}.jsonl"
+        save_dataset(review, out)
+        logger.info("Saved %d examples for review to %s", len(review), out)
+
+    return {"complete": len(complete), "review": len(review)}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Run the extraction pipeline on downloaded exam PDFs.",
+    )
+    parser.add_argument(
+        "--years",
+        nargs="+",
+        default=["1997-2025"],
+        help="Years to process (e.g. 2024 or 1997-2025). Default: 1997-2025",
+    )
+    parser.add_argument(
+        "--vestibular",
+        default="FUVEST",
+        help="Exam board name. Default: FUVEST",
+    )
+    parser.add_argument(
+        "--overwrite-cache",
+        action="store_true",
+        help="Re-run OCR even if cached Markdown exists.",
+    )
+    args = parser.parse_args(argv)
+
+    _load_dotenv()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    # Example: process FUVEST 2024
-    config = PipelineConfig(
-        vestibular="FUVEST",
-        year=2024,
-        questions_pdf=Path("raw_pdfs/fuvest_2024_questoes.pdf"),
-        answers_pdf=Path("raw_pdfs/fuvest_2024_gabarito.pdf"),
-        output_path=Path("data/fuvest/physics.jsonl"),
-        cache_dir=Path("cache"),
-    )
+    vest_lower = args.vestibular.lower()
+    questions_dir = _BASE_DIR / "raw_pdfs" / vest_lower / "questoes"
+    answers_dir = _BASE_DIR / "raw_pdfs" / vest_lower / "gabaritos"
+    data_dir = _BASE_DIR / "data" / vest_lower
+    review_dir = data_dir / "review"
+    cache_dir = _BASE_DIR / "cache"
 
-    examples = run_pipeline(config)
-    print(f"\nDone — {len(examples)} questions extracted.")
+    years = _parse_years(args.years)
+    logger.info("Processing %s for years: %s", args.vestibular, years)
+
+    summary: dict[int, dict[str, int]] = {}
+
+    for year in years:
+        counts = _process_year(
+            year,
+            vestibular=args.vestibular,
+            questions_dir=questions_dir,
+            answers_dir=answers_dir,
+            data_dir=data_dir,
+            review_dir=review_dir,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+        )
+        if counts is not None:
+            summary[year] = counts
+
+    logger.info("--- Summary ---")
+    for year, counts in summary.items():
+        logger.info(
+            "  %d  complete=%-3d  review=%d",
+            year,
+            counts["complete"],
+            counts["review"],
+        )
+
+
+if __name__ == "__main__":
+    main()

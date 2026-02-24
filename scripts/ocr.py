@@ -17,81 +17,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _OCR_PROMPT = (
-    "Extract all text from this document page. "
+    "Extract all text from this exam page. "
     "Preserve the original structure, including "
-    "LaTeX equations as $...$ or $$...$$. "
+    "LaTeX equations as $...$ or $$...$$.\n"
+    "Questions are identified by codes: one uppercase letter followed "
+    "by two digits (e.g. F01, M03, Q05). Be very careful to transcribe "
+    "these codes exactly as printed — do NOT confuse similar-looking "
+    "letters (E vs F, G vs C, etc.).\n"
     "Return only the extracted text, no commentary."
 )
 
 _PAGE_SEPARATOR = "\n\n---\n\n"
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def pdf_to_markdown(
-    pdf_path: Path, cache_dir: Path, overwrite: bool = False
-) -> str:
-    """Convert a PDF to Markdown via vision-LLM OCR, with per-page caching.
-
-    Cache layout::
-
-        cache/
-          <stem>-<hash>/        # one subdir per PDF
-            page-01.md
-            page-02.md
-            ...
-          <stem>-<hash>.md      # combined final file
-
-    The cache key incorporates the resolved path, file size, and mtime so
-    that renames, moves, and in-place edits all invalidate correctly.
-
-    If the combined ``.md`` already exists and *overwrite* is False the
-    cached version is returned immediately (fast path).  Otherwise each
-    page is checked individually — only missing pages are sent through OCR,
-    making interrupted runs resumable.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    resolved = pdf_path.resolve()
-    stat = resolved.stat()
-    material = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
-    cache_key = hashlib.sha256(material.encode()).hexdigest()[:12]
-
-    combined_path = cache_dir / f"{pdf_path.stem}-{cache_key}.md"
-    page_dir = cache_dir / f"{pdf_path.stem}-{cache_key}"
-
-    # Fast path: combined file exists and no overwrite requested.
-    if combined_path.exists() and not overwrite:
-        logger.info("Cache hit: %s", combined_path)
-        return combined_path.read_text(encoding="utf-8")
-
-    # Render all pages to PNG images.
-    images = _pdf_to_images(pdf_path)
-    page_dir.mkdir(parents=True, exist_ok=True)
-
-    # OCR each page, skipping those already cached.
-    ocr_fn = _ocr_page_fn()
-    pages_text: list[str] = []
-
-    for i, img_bytes in enumerate(images):
-        page_cache = page_dir / f"page-{i + 1:02d}.md"
-
-        if page_cache.exists() and not overwrite:
-            logger.info("Page %d/%d cached", i + 1, len(images))
-            pages_text.append(page_cache.read_text(encoding="utf-8"))
-            continue
-
-        text = ocr_fn(img_bytes, page_num=i + 1, total=len(images))
-        page_cache.write_text(text, encoding="utf-8")
-        pages_text.append(text)
-
-    combined = _PAGE_SEPARATOR.join(pages_text)
-    combined_path.write_text(combined, encoding="utf-8")
-    logger.info("Cached Markdown to %s", combined_path)
-    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +118,7 @@ def _pdf_to_images(pdf_path: Path) -> list[bytes]:
     """Render each page of a PDF as a PNG image using pymupdf."""
     import pymupdf
 
-    dpi = int(os.environ.get("OCR_DPI", "150"))
+    dpi = int(os.environ.get("OCR_DPI", "200"))
     doc = pymupdf.open(str(pdf_path))
     images: list[bytes] = []
     for page in doc:
@@ -190,3 +126,74 @@ def _pdf_to_images(pdf_path: Path) -> list[bytes]:
         images.append(pixmap.tobytes("png"))
     doc.close()
     return images
+
+    # ---------------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------------
+
+
+ocr_fn = _ocr_page_fn()
+
+
+def pdf_to_markdown(
+    pdf_path: Path,
+    cache_dir: Path,
+    overwrite: bool = False,
+) -> list[str]:
+    """Convert a PDF to Markdown via vision-LLM OCR, with per-page caching.
+
+    Cache layout::
+
+        cache/
+          <stem>-<hash>/        # one subdir per PDF
+            page-01.md
+            page-02.md
+            ...
+          <stem>-<hash>.md      # combined final file
+
+    The cache key incorporates the resolved path, file size, and mtime so
+    that renames, moves, and in-place edits all invalidate correctly.
+
+    If the combined ``.md`` already exists and *overwrite* is False the
+    cached version is returned immediately (fast path).  Otherwise each
+    page is checked individually — only missing pages are sent through OCR,
+    making interrupted runs resumable.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved = pdf_path.resolve()
+    stat = resolved.stat()
+    material = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+    cache_key = hashlib.sha256(material.encode()).hexdigest()[:12]
+
+    combined_path = cache_dir / f"{pdf_path.stem}-{cache_key}.md"
+    page_dir = cache_dir / f"{pdf_path.stem}-{cache_key}"
+
+    # Fast path: combined file exists and no overwrite requested.
+    if combined_path.exists() and not overwrite:
+        logger.info("Cache hit: %s", combined_path)
+        return combined_path.read_text(encoding="utf-8").split(_PAGE_SEPARATOR)
+
+    # Render all pages to PNG images.
+    images = _pdf_to_images(pdf_path)
+    page_dir.mkdir(parents=True, exist_ok=True)
+
+    # OCR each page, skipping those already cached.
+    pages_text: list[str] = []
+
+    for i, img_bytes in enumerate(images):
+        page_cache = page_dir / f"page-{i + 1:02d}.md"
+
+        if page_cache.exists() and not overwrite:
+            logger.info("Page %d/%d cached", i + 1, len(images))
+            pages_text.append(page_cache.read_text(encoding="utf-8"))
+            continue
+
+        text = ocr_fn(img_bytes=img_bytes, page_num=i + 1, total=len(images))
+        page_cache.write_text(text, encoding="utf-8")
+        pages_text.append(text)
+
+    combined = _PAGE_SEPARATOR.join(pages_text)
+    combined_path.write_text(combined, encoding="utf-8")
+    logger.info("Cached Markdown to %s", combined_path)
+    return pages_text

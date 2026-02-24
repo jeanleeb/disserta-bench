@@ -1,6 +1,10 @@
 from dspy import InputField, OutputField, Signature
 
-from scripts.pipeline.models import AIExtractedQuestion, ExamPageType
+from scripts.pipeline.models import (
+    AIExtractedQuestion,
+    ExamPageType,
+    ExtractedAnswerSet,
+)
 
 
 class ClassifyPage(Signature):
@@ -53,3 +57,65 @@ class ExtractQuestion(Signature):
         desc="Identifier of the question to extract, exactly as printed"
     )
     question_data: AIExtractedQuestion = OutputField()
+
+
+class ExtractAnswers(Signature):
+    """Extract expected answers and any grading criteria for a single
+    question from official solution text."""
+
+    solution_text: str = InputField(
+        desc=(
+            "Markdown of the official solution page(s) for this exam. "
+            "May contain solutions for multiple questions — extract only the "
+            "one matching question_number."
+        )
+    )
+    question_number: str = InputField(
+        desc="Question identifier to extract answers for, e.g. 'Questão 3', 'F01'."
+    )
+    answers: ExtractedAnswerSet = OutputField(
+        desc=(
+            "Answers and rubric for each sub-item of this question. "
+            "Must match the sub-item structure of question_text. "
+            "Extract only what is explicitly stated — set fields to "
+            "None when the solution does not provide them."
+        )
+    )
+
+
+class GenerateRubric(Signature):
+    """Create a step-by-step correction rubric for a physics question item,
+    suitable for grading a student's handwritten solution."""
+
+    question_preamble: str | None = InputField(
+        desc=(
+            "Shared preamble common to all sub-items: context, data, "
+            "figure references. None if there is no shared preamble, "
+            "full question text if there are no sub-items."
+        )
+    )
+    item_text: str = InputField(
+        desc=(
+            "Full text of this sub-item or standalone question, "
+            "with LaTeX for equations."
+        )
+    )
+    expected_answer: str = InputField(
+        desc="The correct final answer, including units when applicable."
+    )
+    reference_data: list[str] = InputField(
+        desc=(
+            "Given constants and/or simplifications from the problem "
+            "statement, e.g. ['g = 10 m/s²', 'ignore air resistance']. "
+            "The rubric must accept solutions that use these values. "
+            "May be empty."
+        )
+    )
+    rubric: str = OutputField(
+        desc=(
+            "Correction rubric in Portuguese. Include: the essential "
+            "reasoning steps, key intermediate results for calculations, "
+            "the expected final value or explanation, acceptable tolerance "
+            "for numerical answers, and common errors to watch for."
+        )
+    )

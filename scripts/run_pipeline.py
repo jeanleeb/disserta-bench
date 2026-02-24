@@ -11,7 +11,8 @@ from pathlib import Path
 import dspy
 
 from scripts.ocr import pdf_to_markdown
-from scripts.pipeline.models import Subject, Vestibular
+from scripts.pipeline.answer_extractor import AnswerExtractor
+from scripts.pipeline.models import GradedQuestion, Subject, Vestibular
 from scripts.pipeline.page_classifier import PageClassifier
 from scripts.pipeline.question_extractor import QuestionExtractor
 
@@ -73,7 +74,7 @@ class PipelineConfig:
     overwrite_cache: bool = False
 
 
-def run_pipeline(config: PipelineConfig) -> None:
+def run_pipeline(config: PipelineConfig) -> list[GradedQuestion]:
     """Run the full extraction pipeline for one exam.
 
     Steps:
@@ -87,18 +88,20 @@ def run_pipeline(config: PipelineConfig) -> None:
     logger.info("Starting pipeline: %s %d", config.vestibular, config.year)
 
     # Step 1: OCR - questions PDF → Markdown
-    pages = pdf_to_markdown(
+    questions_pdf_pages = pdf_to_markdown(
         config.questions_pdf,
         config.cache_dir,
         overwrite=config.overwrite_cache,
     )
-    logger.info("%d pages extracted", len(pages))
+    logger.info("%d pages extracted from questions PDF", len(questions_pdf_pages))
 
     # Step 2: classify pages
     classifier = PageClassifier()
     with dspy.settings.context(lm=config.lite_lm):
         question_pages = [
-            page for page in pages if classifier(page_markdown=page) == "questions"
+            page
+            for page in questions_pdf_pages
+            if classifier(page_markdown=page) == "questions"
         ]
     logger.info("%d question pages found", len(question_pages))
 
@@ -107,12 +110,44 @@ def run_pipeline(config: PipelineConfig) -> None:
     questions = extractor(
         pages=question_pages, vestibular=config.vestibular, year=config.year
     )
+    logger.info("Questions extracted: %d questions", len(questions))
+
+    # Step 4: OCR - solution PDF → Markdown
+    solution_pdf_pages: list[str] = []
+    if config.answers_pdf is not None:
+        solution_pdf_pages = pdf_to_markdown(
+            config.answers_pdf,
+            config.cache_dir,
+            overwrite=config.overwrite_cache,
+        )
+        logger.info("%d pages extracted from answers PDF", len(solution_pdf_pages))
+
+    # Step 5: classify solution pages
+    with dspy.settings.context(lm=config.lite_lm):
+        solution_pages = [
+            page
+            for page in solution_pdf_pages
+            if classifier(page_markdown=page) != "other"
+        ]
+    logger.info("%d solution pages after filtering", len(solution_pages))
+
+    # Step 6: extract solutions
+    answer_extractor = AnswerExtractor(
+        cache_dir=config.cache_dir / "graded",
+    )
+    graded = answer_extractor(
+        questions=questions,
+        solution_pages=solution_pages,
+    )
+    logger.info("Solutions extracted: %d questions graded", len(graded))
 
     logger.info(
         "Pipeline done: %d questions (%.1fs)",
         len(questions),
         time.time() - start,
     )
+
+    return graded
 
 
 def _parse_exam_day(filename: str) -> str | None:

@@ -16,10 +16,14 @@ from pathlib import Path
 
 @dataclass
 class Constant:
-    """A physical constant or given value provided in the question statement."""
+    """A physical constant or given value provided in the question statement.
+
+    The *value* is stored as a string to preserve scientific notation
+    (e.g. ``"1.6e-19"``) that would be lost with a plain ``float``.
+    """
 
     symbol: str
-    value: float
+    value: str
     unit: str
 
     def to_dict(self) -> dict:
@@ -46,6 +50,28 @@ class ReferenceData:
 
 
 @dataclass
+class ExpectedAnswer:
+    """Expected answer for one sub-item of a discursive question.
+
+    For example, item "a)" might have value ``"120"`` with unit ``"N"``.
+    Items that are qualitative (no numeric answer) use *value* ``None``.
+    """
+
+    label: str  # e.g. "a", "b", "c"
+    value: str | None = None  # numeric answer as string (preserves notation)
+    unit: str = ""
+    explanation: str = ""  # brief expected reasoning
+
+    def to_dict(self) -> dict:
+        return {
+            "label": self.label,
+            "value": self.value,
+            "unit": self.unit,
+            "explanation": self.explanation,
+        }
+
+
+@dataclass
 class PhysicsExample:
     """
     A single physics question from a Brazilian university entrance exam.
@@ -54,13 +80,13 @@ class PhysicsExample:
         question, reference_data
 
     Evaluation labels (for metrics and judges only):
-        expected_value, expected_unit, solution_steps, rubric
+        expected_answers, solution_steps, rubric
     """
 
     # --- Metadata ---
     vestibular: str  # Exam board (e.g., "FUVEST", "ITA", "Unicamp")
     year: int  # Exam year
-    question_number: str  # Question identifier (e.g., "Q3", "Q5a")
+    question_number: str  # Question identifier (e.g., "F01", "M03")
     topic: str  # Physics subfield (e.g., "Thermodynamics")
 
     # --- Solver input ---
@@ -68,14 +94,16 @@ class PhysicsExample:
     reference_data: ReferenceData = field(default_factory=ReferenceData)
 
     # --- Evaluation labels ---
-    expected_value: float | None = None
-    expected_unit: str | None = None
+    expected_answers: list[ExpectedAnswer] = field(default_factory=list)
     solution_steps: str | None = None  # Official step-by-step solution
     rubric: list[str] = field(default_factory=list)  # Per-question criteria
 
     # --- Figure handling ---
     has_figure: bool = False
     figure_description: str = ""
+
+    # --- Provenance ---
+    original_code: str = ""  # Original exam code when different from question_number
 
     # --- Review status ---
     needs_review: bool = False
@@ -89,18 +117,21 @@ class PhysicsExample:
             "topic": self.topic,
             "question": self.question,
             "reference_data": self.reference_data.to_dict(),
-            "expected_value": self.expected_value,
-            "expected_unit": self.expected_unit,
+            "expected_answers": [a.to_dict() for a in self.expected_answers],
             "solution_steps": self.solution_steps,
             "rubric": self.rubric,
             "has_figure": self.has_figure,
             "figure_description": self.figure_description,
+            "original_code": self.original_code,
             "needs_review": self.needs_review,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> PhysicsExample:
         """Deserialize from a dictionary (e.g., one parsed JSONL line)."""
+        answers = [
+            ExpectedAnswer(**a) for a in data.get("expected_answers", [])
+        ]
         return cls(
             vestibular=data["vestibular"],
             year=data["year"],
@@ -108,12 +139,12 @@ class PhysicsExample:
             topic=data["topic"],
             question=data["question"],
             reference_data=ReferenceData.from_dict(data.get("reference_data", {})),
-            expected_value=data.get("expected_value"),
-            expected_unit=data.get("expected_unit"),
+            expected_answers=answers,
             solution_steps=data.get("solution_steps"),
             rubric=data.get("rubric", []),
             has_figure=data.get("has_figure", False),
             figure_description=data.get("figure_description", ""),
+            original_code=data.get("original_code", ""),
             needs_review=data.get("needs_review", False),
         )
 
@@ -165,10 +196,8 @@ def validate_dataset(examples: list[PhysicsExample]) -> list[str]:
         if not ex.question.strip():
             warnings.append(f"{label} Empty question text.")
         if not ex.needs_review:
-            if ex.expected_value is None:
-                warnings.append(f"{label} Missing expected_value.")
-            if not ex.expected_unit:
-                warnings.append(f"{label} Missing expected_unit.")
+            if not ex.expected_answers:
+                warnings.append(f"{label} No expected_answers defined.")
             if not ex.solution_steps:
                 warnings.append(f"{label} Missing solution_steps.")
         if not ex.rubric:

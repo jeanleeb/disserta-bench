@@ -26,6 +26,7 @@ from typing import Any
 
 from scripts.dataset_schema import (
     Constant,
+    ExpectedAnswer,
     PhysicsExample,
     ReferenceData,
     save_dataset,
@@ -35,6 +36,17 @@ from scripts.llm import extract_questions_with_llm
 from scripts.ocr import pdf_to_markdown
 
 logger = logging.getLogger(__name__)
+
+# Maps LLM subject to the single-letter FUVEST code prefix.
+_SUBJECT_TO_PREFIX: dict[str, str] = {
+    "physics": "F",
+    "math": "M",
+    "chemistry": "Q",
+    "biology": "B",
+    "geography": "G",
+    "history": "H",
+    "portuguese": "P",
+}
 
 
 def _load_dotenv() -> None:
@@ -64,12 +76,12 @@ class PipelineConfig:
     """Configuration for a single pipeline run.
 
     Attributes:
-        vestibular:     Exam board name (e.g., "FUVEST").
-        year:           Exam year.
-        questions_pdf:  Path to the questions PDF.
-        answers_pdf:    Path to the answers/gabarito PDF. If None, assumes
-                        answers are embedded in questions_pdf.
-        cache_dir:      Directory for intermediate Markdown files.
+        vestibular:      Exam board name (e.g., "FUVEST").
+        year:            Exam year.
+        questions_pdf:   Path to the questions PDF.
+        answers_pdf:     Path to the answers/gabarito PDF. If None, assumes
+                         answers are embedded in questions_pdf.
+        cache_dir:       Directory for intermediate Markdown files.
         overwrite_cache: If True, re-runs OCR even if cache exists.
     """
 
@@ -122,30 +134,47 @@ def _dict_to_example(raw: dict, vestibular: str, year: int) -> PhysicsExample:
     constants = [
         Constant(
             symbol=c["symbol"],
-            value=float(c["value"]),
+            value=str(c["value"]),
             unit=c["unit"],
         )
         for c in ref_data.get("constants", [])
     ]
 
+    answers = [
+        ExpectedAnswer(
+            label=a.get("label", ""),
+            value=str(a["value"]) if a.get("value") is not None else None,
+            unit=a.get("unit", ""),
+            explanation=a.get("explanation", ""),
+        )
+        for a in raw.get("expected_answers", [])
+    ]
+
+    # Resolve question code: if from generic format ("01"), derive
+    # prefixed code ("F01") from the LLM-classified subject.
+    question_number = raw["question_number"]
+    original_code = ""
+    if raw.get("_from_generic"):
+        original_code = question_number
+        subject = raw.get("subject", "").lower()
+        prefix = _SUBJECT_TO_PREFIX.get(subject, "X")
+        question_number = f"{prefix}{original_code}"
+
     return PhysicsExample(
         vestibular=vestibular,
         year=year,
-        question_number=raw["question_number"],
+        question_number=question_number,
         topic=raw["topic"],
         question=raw["question"],
         reference_data=ReferenceData(constants=constants),
-        expected_value=(
-            float(raw["expected_value"])
-            if raw.get("expected_value") is not None
-            else None
-        ),
-        expected_unit=raw.get("expected_unit", ""),
+        expected_answers=answers,
         solution_steps=raw.get("solution_steps", ""),
         rubric=raw.get("rubric", []),
         has_figure=bool(raw.get("has_figure", False)),
         figure_description=raw.get("figure_description", ""),
+        original_code=original_code,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +213,33 @@ def run_pipeline(config: PipelineConfig) -> list[PhysicsExample]:
         logger.info("No separate answers PDF — using questions Markdown for both.")
         answers_md = questions_md
 
-    # Step 3: LLM extraction
-    raw_questions = extract_questions_with_llm(questions_md, answers_md)
+    # Step 3: LLM extraction (per-question, cached)
+    raw_questions = extract_questions_with_llm(
+        questions_md,
+        answers_md,
+        vestibular=config.vestibular,
+        year=config.year,
+        cache_dir=config.cache_dir,
+        overwrite_cache=config.overwrite_cache,
+    )
     logger.info("LLM extracted %d raw questions.", len(raw_questions))
 
+    # Step 3b: filter to physics questions only
+    physics_questions = [
+        q for q in raw_questions
+        if isinstance(q, dict)
+        and q.get("subject", "").lower() == "physics"
+    ]
+    logger.info(
+        "Filtered to %d physics questions (from %d total).",
+        len(physics_questions),
+        len(raw_questions),
+    )
+
     # Step 4: convert to schema objects
-    examples = dicts_to_examples(raw_questions, config.vestibular, config.year)
+    examples = dicts_to_examples(
+        physics_questions, config.vestibular, config.year,
+    )
     logger.info("Converted %d questions successfully.", len(examples))
 
     # Step 5: validate
@@ -295,10 +345,10 @@ def _process_year(
         )
         all_examples.extend(run_pipeline(config))
 
-    complete = [ex for ex in all_examples if ex.expected_value is not None]
+    complete = [ex for ex in all_examples if ex.expected_answers]
     review = []
     for ex in all_examples:
-        if ex.expected_value is None:
+        if not ex.expected_answers:
             ex.needs_review = True
             review.append(ex)
 
